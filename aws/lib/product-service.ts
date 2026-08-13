@@ -2,6 +2,7 @@ import { Duration } from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
+import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as cloudmap from "aws-cdk-lib/aws-servicediscovery";
 import { Construct } from "constructs";
@@ -55,6 +56,14 @@ export class ProductService extends Construct {
   public readonly service: ecs.FargateService;
   public readonly securityGroup: ec2.SecurityGroup;
 
+  /**
+   * The identity the container runs as. Exposed so callers can grant it access to
+   * things directly, which is the point: boto3 and the AWS SDKs pick this up through
+   * the default credential chain, so a task reaches S3 with no access key anywhere in
+   * the configuration, the image, or this repository.
+   */
+  public readonly taskRole: iam.IRole;
+
   constructor(scope: Construct, id: string, props: ProductServiceProps) {
     super(scope, id);
 
@@ -66,6 +75,8 @@ export class ProductService extends Construct {
         operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
       },
     });
+
+    this.taskRole = taskDefinition.taskRole;
 
     taskDefinition.addContainer("app", {
       image: props.image,

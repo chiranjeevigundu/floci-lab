@@ -4,6 +4,7 @@ import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as rds from "aws-cdk-lib/aws-rds";
+import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as cloudmap from "aws-cdk-lib/aws-servicediscovery";
 import type { Construct } from "constructs";
@@ -136,6 +137,18 @@ export class PlatformStack extends Stack {
       generateSecretString: { passwordLength: 16, excludePunctuation: true },
     });
 
+    // ------------------------------------------------------------- storage
+    //
+    // Adopted, not created. This bucket predates the stack and already holds uploads,
+    // so CDK references it by name and grants access to it. Declaring a new bucket here
+    // would either fail on the name already existing or, worse, succeed with a
+    // different name and quietly strand everything already stored.
+    const uploads = s3.Bucket.fromBucketName(
+      this,
+      "Uploads",
+      `aadyon-uploads-${this.account}`,
+    );
+
     // ------------------------------------------------------------- services
     const ragService = new ProductService(this, "HybridRag", {
       cluster,
@@ -194,6 +207,19 @@ export class PlatformStack extends Stack {
         // Over the private namespace rather than back out through the load balancer.
         // Same VPC, no public hop, and it keeps working if the RAG listener is closed.
         RAG_SERVICE_URL: `http://hybrid-rag.${namespace.namespaceName}:8080`,
+        // Uploads must not go to the container filesystem. Fargate discards it on every
+        // task replacement, so a document uploaded on Tuesday is gone after Wednesday's
+        // deploy, and nothing reports an error when it happens.
+        STORAGE_BACKEND: "s3",
+        S3_BUCKET_NAME: uploads.bucketName,
+        S3_REGION: this.region,
+        // The task role is scoped to this one bucket and cannot call CreateBucket. The
+        // bucket already exists, so the startup bootstrap has nothing to do and would
+        // only fail with an access denied that looks like a misconfiguration.
+        S3_AUTO_CREATE_BUCKET: "false",
+        // No S3_ACCESS_KEY or S3_SECRET_KEY on purpose. llmkit passes static
+        // credentials only when both are set, so leaving them unset falls through to
+        // boto3's default chain, which on Fargate is the task role.
       },
       secrets: {
         // Assist reads POSTGRES_PASSWORD, not DB_PASSWORD. Its config prefers a file
@@ -205,6 +231,11 @@ export class PlatformStack extends Stack {
         OPENROUTER_API_KEY: ecs.Secret.fromSecretsManager(openRouterKey),
       },
     });
+
+    // Read and write on the uploads bucket, and nothing else anywhere. This replaces
+    // the aadyon-s3 IAM user's static access key, which never needs to exist for a
+    // deployment that runs inside AWS.
+    uploads.grantReadWrite(assistService.taskRole);
 
     dbSecurityGroup.addIngressRule(
       ragService.securityGroup,
