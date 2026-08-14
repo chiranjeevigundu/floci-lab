@@ -1,4 +1,4 @@
-import { Duration } from "aws-cdk-lib";
+import { Duration, RemovalPolicy } from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
@@ -64,8 +64,15 @@ export class ProductService extends Construct {
    */
   public readonly taskRole: iam.IRole;
 
+  /** Exposed so the dashboard can graph health and latency per product. */
+  public readonly targetGroup: elbv2.ApplicationTargetGroup;
+
+  /** Kept for widget titles and alarm names. */
+  public readonly serviceName: string;
+
   constructor(scope: Construct, id: string, props: ProductServiceProps) {
     super(scope, id);
+    this.serviceName = props.serviceName;
 
     const taskDefinition = new ecs.FargateTaskDefinition(this, "TaskDef", {
       cpu: props.cpu ?? 256,
@@ -93,6 +100,12 @@ export class ProductService extends Construct {
           // Logs are the quiet line item that grows forever. Two weeks is long enough
           // to debug a bad deploy and short enough to stay near zero.
           retention: logs.RetentionDays.TWO_WEEKS,
+          // CDK defaults log groups to RETAIN, which sounds prudent and is actively
+          // harmful for a named group: a rolled-back stack leaves the group behind, and
+          // the next deploy fails with "already exists" before it creates anything. The
+          // retention above already caps what is kept, so retaining the container past
+          // the stack it belongs to preserves nothing except an obstacle.
+          removalPolicy: RemovalPolicy.DESTROY,
         }),
       }),
     });
@@ -132,7 +145,7 @@ export class ProductService extends Construct {
       open: true,
     });
 
-    listener.addTargets("Target", {
+    this.targetGroup = listener.addTargets("Target", {
       port: props.containerPort,
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [this.service],

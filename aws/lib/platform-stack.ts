@@ -8,6 +8,7 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as cloudmap from "aws-cdk-lib/aws-servicediscovery";
 import type { Construct } from "constructs";
+import { Observability } from "./observability";
 import { ProductService } from "./product-service";
 
 export interface PlatformStackProps extends StackProps {
@@ -92,7 +93,16 @@ export class PlatformStack extends Stack {
 
     const database = new rds.DatabaseInstance(this, "Database", {
       engine: rds.DatabaseInstanceEngine.postgres({
-        version: rds.PostgresEngineVersion.VER_16_6,
+        // Written as a literal rather than PostgresEngineVersion.VER_16_x on purpose.
+        // The enum is a compile-time list baked into whichever aws-cdk-lib is installed,
+        // and it does not track what RDS actually offers: VER_16_6 exists in the enum,
+        // type checks, synthesises, and then fails at deploy with "Cannot find version
+        // 16.6 for postgres" because RDS never shipped it in this region. A literal is
+        // no less safe and is honest about the fact that only RDS knows the answer.
+        //   aws rds describe-orderable-db-instance-options \
+        //     --engine postgres --db-instance-class db.t4g.micro \
+        //     --query 'OrderableDBInstanceOptions[].EngineVersion'
+        version: rds.PostgresEngineVersion.of("16.14", "16"),
       }),
       // Graviton burstable. pgvector ships with RDS Postgres 15.2 and later, so
       // hybrid-rag's CREATE EXTENSION vector works without a custom parameter group.
@@ -137,6 +147,14 @@ export class PlatformStack extends Stack {
       generateSecretString: { passwordLength: 16, excludePunctuation: true },
     });
 
+    // How many tasks each service runs. Zero is not a curiosity: on a first deploy the
+    // databases do not exist and no migration has run, and /health does a real query,
+    // so a task would never turn healthy and the circuit breaker would roll back the
+    // whole stack after RDS had spent fifteen minutes creating itself. Bring the
+    // infrastructure up empty, bootstrap the schemas, then scale up.
+    //   cdk deploy -c desiredCount=0
+    const desiredCount = Number(this.node.tryGetContext("desiredCount") ?? 1);
+
     // ------------------------------------------------------------- storage
     //
     // Adopted, not created. This bucket predates the stack and already holds uploads,
@@ -161,6 +179,7 @@ export class PlatformStack extends Stack {
       containerPort: 8080,
       listenerPort: 8080,
       healthCheckPath: "/health",
+      desiredCount,
       // The image carries the embedding model and is about 1.4 GB, and the service
       // builds an ONNX session before it answers /health. A short grace period would
       // kill the task while it is still starting, forever.
@@ -197,11 +216,20 @@ export class PlatformStack extends Stack {
       containerPort: 8000,
       listenerPort: 80,
       healthCheckPath: "/api/health",
+      desiredCount,
       cpu: 512,
       memoryLimitMiB: 1024,
       environment: {
         DB_HOST: database.dbInstanceEndpointAddress,
-        DB_USER: "aadyon",
+        // aadyon_app, NOT aadyon. The two roles are not interchangeable: aadyon owns
+        // the schema and is DDL-privileged, which means Postgres exempts it from row
+        // level security entirely. aadyon_app is the restricted role the FORCE ROW
+        // LEVEL SECURITY policies actually bind to.
+        //
+        // Running the API as the owner does not fail, warn, or degrade. Every query
+        // simply returns every tenant's rows, and with a single test account that looks
+        // exactly like working software.
+        DB_USER: "aadyon_app",
         POSTGRES_DB: "aadyon",
         DEV_MODE: "false",
         // Over the private namespace rather than back out through the load balancer.
@@ -248,6 +276,21 @@ export class PlatformStack extends Stack {
       "aadyon-assist to Postgres",
     );
 
+    // ------------------------------------------------------- observability
+    //
+    // alarmEmail is context-driven because a subscription has to be confirmed from the
+    // inbox; wiring an address nobody confirms produces alarms that fire into nothing,
+    // which is worse than having none because it looks covered.
+    //   cdk deploy -c alarmEmail=you@example.com
+    const alarmEmail = this.node.tryGetContext("alarmEmail") as string | undefined;
+    const observability = new Observability(this, "Observability", {
+      loadBalancer: alb,
+      database,
+      services: [ragService, assistService],
+      alarmEmail,
+      monthlyBudgetUsd: Number(this.node.tryGetContext("monthlyBudgetUsd") ?? 75),
+    });
+
     // ------------------------------------------------------------- outputs
     new CfnOutput(this, "AssistUrl", {
       value: `http://${alb.loadBalancerDnsName}`,
@@ -260,6 +303,14 @@ export class PlatformStack extends Stack {
     new CfnOutput(this, "DatabaseEndpoint", {
       value: database.dbInstanceEndpointAddress,
       description: "Postgres endpoint, reachable only from inside the VPC",
+    });
+    new CfnOutput(this, "DashboardUrl", {
+      value: `https://${this.region}.console.aws.amazon.com/cloudwatch/home?region=${this.region}#dashboards/dashboard/${observability.dashboard.dashboardName}`,
+      description: "CloudWatch dashboard",
+    });
+    new CfnOutput(this, "AlarmTopicArn", {
+      value: observability.alarmTopic.topicArn,
+      description: "SNS topic alarms publish to",
     });
     new CfnOutput(this, "DatabaseSecretArn", {
       value: database.secret!.secretArn,
