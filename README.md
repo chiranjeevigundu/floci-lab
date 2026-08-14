@@ -1,7 +1,12 @@
 # floci-lab
 
-My local cloud: an AWS API emulator, a Kubernetes cluster, a container registry, and
-self-hosted tracing — plus the one deploy script every product uses.
+Where the Aadyon products get deployed, in both directions: a local AWS emulator with a
+Kubernetes cluster, a container registry and self-hosted tracing — and, in `aws/`, CDK
+that puts two of them on real ECS Fargate.
+
+The local half is the everyday loop: free, offline, and fast. The real half exists
+because an emulator has documented gaps, and the only way to find out which ones matter
+is to deploy against the actual APIs once.
 
 ```bash
 git clone https://github.com/chiranjeevigundu/floci-lab
@@ -115,6 +120,22 @@ so a repo-root submodule is not even visible to the build, and submodules break
 bin/deploy-k8s.sh    the shared deployer, parameterised by deploy.env
 bin/up.sh            start Floci (and optionally LangFuse)
 compose/             Floci emulator + self-hosted LangFuse
+aws/                 CDK: hybrid-rag + aadyon-assist on ECS Fargate, real AWS
+```
+
+## The AWS half
+
+`aws/` is a CDK app putting `hybrid-rag` and `aadyon-assist` on Fargate behind one load
+balancer, sharing one RDS instance. Roughly 47 USD/month, most of the saving from running
+tasks in public subnets so the stack needs no NAT gateway — which would otherwise have
+been the largest line item on the bill.
+
+**It has been synthesised, never deployed.** See [aws/README.md](aws/README.md) for the
+three things that must happen before a first deploy, and for why `aadyon-server` and
+`synapse` are deliberately not in it.
+
+```bash
+cd aws && npm ci && npx cdk synth   # needs no AWS session
 ```
 
 ## LangFuse
